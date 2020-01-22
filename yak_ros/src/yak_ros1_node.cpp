@@ -1,24 +1,22 @@
-#include <ros/ros.h>
-
-#include <yak/yak_server.h>
-#include <yak/mc/marching_cubes.h>
-
-#include <yak_msgs/ResetParams.h>
-
-#include <gl_depth_sim/interfaces/opencv_interface.h>
+#include <queue>
+#include <string>
 
 #include <pcl_ros/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/ply_io.h>
 
-#include <sensor_msgs/PointCloud2.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_eigen/tf2_eigen.h>
 #include <cv_bridge/cv_bridge.h>
-
+#include <gl_depth_sim/interfaces/opencv_interface.h>
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <std_srvs/Trigger.h>
 #include <std_srvs/SetBool.h>
-#include <queue>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_eigen/tf2_eigen.h>
+
+#include <yak/yak_server.h>
+#include <yak/mc/marching_cubes.h>
+#include <yak_msgs/ResetParams.h>
 
 static const std::double_t DEFAULT_MINIMUM_TRANSLATION = 0.00001;
 
@@ -70,59 +68,87 @@ private:
    */
   void onReceivedDepthImg(const sensor_msgs::ImageConstPtr& image_in)
   {
+    // Add the new image to the queue
     image_q_.push(image_in);
-    if(image_q_.size() > 2){
+
+    while (image_q_.size() > 2)
+    {
       auto next_image = image_q_.front();
-      image_q_.pop(); // remove it now
 
       // Get the camera pose in the tsdf frame at the time when the depth image was generated.
-      ROS_INFO_STREAM("Got depth image");
       geometry_msgs::TransformStamped transform_tsdf_to_camera;
       try
-	{
-	  transform_tsdf_to_camera = tf_buffer_.lookupTransform(tsdf_frame_name_, next_image->header.frame_id, next_image->header.stamp);
-	}
-      catch(tf2::TransformException &ex)
-	{
-	  // Abort integration if tf lookup failed
-	  ROS_WARN("%s", ex.what());
-	  return;
-	}
+      {
+        transform_tsdf_to_camera = tf_buffer_.lookupTransform(tsdf_frame_name_, next_image->header.frame_id, next_image->header.stamp);
+      }
+      catch (tf2::TransformException &ex)
+      {
+        // Abort integration if tf lookup failed, and try again when next
+        // an image comes in
+        ROS_WARN("%s", ex.what());
+
+        // If lookup failed because one time is in the unknown past,
+        // get rid of it - history will never appear retroactively.
+        if (std::string(ex.what()).find(std::string("past")) != std::string::npos)
+        {
+          image_queue.pop();
+        }
+        return;
+      }
       Eigen::Affine3d tsdf_to_camera = tf2::transformToEigen(transform_tsdf_to_camera);
+
+      // Remove the image only if lookup was successful - oftentimes the
+      // camera publishes before the mutable publishers have supplied the
+      // requisite TF data
+      image_q_.pop();
       
       // Find how much the camera moved since the last depth image. If the magnitude of motion was below some threshold, abort integration.
       // This is to prevent noise from accumulating in the isosurface due to numerous observations from the same pose.
       std::double_t motion_mag = (tsdf_to_camera.inverse() *tsdf_to_camera_prev_).translation().norm();
       ROS_INFO_STREAM(motion_mag);
-      if(motion_mag < DEFAULT_MINIMUM_TRANSLATION)
-	{
-	  ROS_INFO_STREAM("Camera motion below threshold");
-	  return;
-	}
+      if (motion_mag < DEFAULT_MINIMUM_TRANSLATION)
+      {
+        // The image has already been popped, so it will not be considered
+        // anymore after this loop iteration ends.  Use 'continue' instead
+        // of 'return' so that we can consider later images that may have
+        // TF info available.
+        ROS_INFO_STREAM("Camera motion below threshold");
+        continue;
+      }
       
       cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(next_image, sensor_msgs::image_encodings::TYPE_16UC1);
 
-#if (0)// debug the transform by printing it out every 30'th update
+#if (0) // debug the transform by printing it out every 30'th update
       static int q=0;
-      if(q==0){
-	ROS_ERROR("f1 %6.3lf %6.3lf %6.3lf %6.3lf",
-		  tsdf_to_camera.linear().col(0).x(), tsdf_to_camera.linear().col(1).x(),  tsdf_to_camera.linear().col(2).x(), tsdf_to_camera.translation().x());
-	ROS_ERROR("f2 %6.3lf %6.3lf %6.3lf %6.3lf",
-		  tsdf_to_camera.linear().col(0).y(), tsdf_to_camera.linear().col(1).y(),  tsdf_to_camera.linear().col(2).y(),  tsdf_to_camera.translation().y());
-	ROS_ERROR("f3 %6.3lf %6.3lf %6.3lf %6.3lf\n",
-		  tsdf_to_camera.linear().col(0).z(), tsdf_to_camera.linear().col(1).z(),  tsdf_to_camera.linear().col(2).z(),  tsdf_to_camera.translation().z());
+      if(q==0)
+      {
+        ROS_ERROR("f1 %6.3lf %6.3lf %6.3lf %6.3lf",
+                  tsdf_to_camera.linear().col(0).x(), tsdf_to_camera.linear().col(1).x(),  tsdf_to_camera.linear().col(2).x(), tsdf_to_camera.translation().x());
+        ROS_ERROR("f2 %6.3lf %6.3lf %6.3lf %6.3lf",
+                  tsdf_to_camera.linear().col(0).y(), tsdf_to_camera.linear().col(1).y(),  tsdf_to_camera.linear().col(2).y(),  tsdf_to_camera.translation().y());
+        ROS_ERROR("f3 %6.3lf %6.3lf %6.3lf %6.3lf\n",
+                  tsdf_to_camera.linear().col(0).z(), tsdf_to_camera.linear().col(1).z(),  tsdf_to_camera.linear().col(2).z(),  tsdf_to_camera.translation().z());
       }
       q=(q+1)%30;
 #endif      
 
       // Integrate the depth image into the TSDF volume
       if (!fusion_.fuse(cv_ptr->image, tsdf_to_camera.cast<float>()))
-	ROS_WARN_STREAM("Failed to fuse image");
-      
+      {
+        ROS_WARN_STREAM("Failed to fuse image");
+      }
+
       // If integration was successful, update the previous camera pose with the new camera pose
       tsdf_to_camera_prev_ = tsdf_to_camera;
       
-    }
+      /* This loop can break in one of three ways:
+       * 1. Fewer than 3 images in the queue (if TF was successful, the
+       *    number of images will decrease)
+       * 2. TF lookup failed, aborting the callback and therefore the loop
+       */
+
+    } // end image-processing while loop
+
     return;
   }
     
